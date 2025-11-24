@@ -1,209 +1,192 @@
 """
-embed_words.py
-讀取 words.csv → 呼叫 OpenAI Embeddings → 寫入 MySQL 資料表 word_embeddings
-
-前置：
-1. pip install openai pymysql python-dotenv pandas
-2. 檔案結構（例）：
-   backend/
-     ├─ app.py
-     ├─ embed_words.py   ← 放這個
-     └─ words.csv        ← 你的 6000 字 CSV
-
-3. .env 需要：
-   OPENAI_API_KEY=你的金鑰
-   MYSQL_HOST=localhost
-   MYSQL_USER=root
-   MYSQL_PASSWORD=（你的密碼）
-   MYSQL_DB=wordcrack
+embed_words.py — FINAL VERSION
+✔ tqdm 進度條
+✔ ETA 預估
+✔ API 自動重試
+✔ Railway MySQL URL 支援
 """
 
 import os
 import json
 import time
-import traceback
+from urllib.parse import urlparse
 
 import pandas as pd
 import pymysql
 from dotenv import load_dotenv
 from openai import OpenAI
+from tqdm import tqdm
 
-# -----------------------------
-# 讀取 .env
-# -----------------------------
+# ==============================
+# 讀取環境變數
+# ==============================
 load_dotenv()
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-MYSQL_HOST = os.getenv("MYSQL_HOST", "localhost")
-MYSQL_USER = os.getenv("MYSQL_USER", "root")
-MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "")
-MYSQL_DB = os.getenv("MYSQL_DB", "wordcrack")
+MYSQL_URL = os.getenv("MYSQL_URL")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
+if not MYSQL_URL:
+    raise RuntimeError("❌ 缺少 MYSQL_URL，請在 .env 設定")
 if not OPENAI_API_KEY:
-    raise RuntimeError("❌ 沒有找到 OPENAI_API_KEY，請在 .env 裡設定")
+    raise RuntimeError("❌ 缺少 OPENAI_API_KEY，請在 .env 設定")
+
+print("🔍 解析 MySQL_URL =", MYSQL_URL)
+
+url = urlparse(MYSQL_URL)
+MYSQL_HOST = url.hostname
+MYSQL_PORT = url.port
+MYSQL_USER = url.username
+MYSQL_PASSWORD = url.password
+MYSQL_DB = url.path[1:]
+
+print(f"🧭 Host={MYSQL_HOST}, Port={MYSQL_PORT}, User={MYSQL_USER}, DB={MYSQL_DB}")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# -----------------------------
-# 連線 MySQL
-# -----------------------------
-try:
-    db = pymysql.connect(
+# ==============================
+# MySQL 連線
+# ==============================
+def db_conn():
+    return pymysql.connect(
         host=MYSQL_HOST,
+        port=MYSQL_PORT,
         user=MYSQL_USER,
         password=MYSQL_PASSWORD,
         database=MYSQL_DB,
         charset="utf8mb4",
         cursorclass=pymysql.cursors.DictCursor,
-        autocommit=False,  # 批次 commit
+        autocommit=False,
     )
-    print(f"✅ 已連線 MySQL：{MYSQL_HOST} / DB={MYSQL_DB}")
-except Exception:
-    print("❌ 無法連線 MySQL：")
-    traceback.print_exc()
-    raise SystemExit(1)
 
-# -----------------------------
+db = db_conn()
+print("✅ 成功連線 Railway MySQL")
+
+# ==============================
 # 建立 word_embeddings 資料表
-# -----------------------------
-CREATE_TABLE_SQL = """
+# ==============================
+TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS word_embeddings (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  word_id INT NOT NULL,
-  word VARCHAR(255) NOT NULL,
-  embedding JSON NOT NULL,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE KEY uq_word_id (word_id),
-  CONSTRAINT fk_word_embeddings_word
-    FOREIGN KEY (word_id) REFERENCES words(id)
-    ON DELETE CASCADE
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    word_id INT NOT NULL,
+    word VARCHAR(255) NOT NULL,
+    embedding JSON NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_word_id (word_id),
+    FOREIGN KEY (word_id) REFERENCES words(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 """
 
 with db.cursor() as cursor:
-    cursor.execute(CREATE_TABLE_SQL)
+    cursor.execute(TABLE_SQL)
 db.commit()
-print("✅ 已確認建立資料表：word_embeddings")
+print("✅ 已確認 word_embeddings 資料表存在")
 
-# -----------------------------
-# 讀取 words.csv
-# -----------------------------
-CSV_PATH = "words.csv"
+# ==============================
+# 讀 CSV
+# ==============================
+df = pd.read_csv("words.csv")
+print(f"📄 CSV 讀取成功：共 {len(df)} 筆")
 
-if not os.path.exists(CSV_PATH):
-    raise FileNotFoundError(f"❌ 找不到 {CSV_PATH}，請確認檔案路徑")
-
-df = pd.read_csv(CSV_PATH)
-
-# 你的欄位名稱：級別, 單字, 屬性, 中文
-# 做個保險：如果未來你改成英文欄位也能用
-col_level = "級別" if "級別" in df.columns else "level"
 col_word = "單字" if "單字" in df.columns else "word"
-col_pos = "屬性" if "屬性" in df.columns else "part_of_speech"
-col_cn = "中文" if "中文" in df.columns else "chinese"
 
-print(f"📄 CSV 總列數：{len(df)}")
-print("📌 欄位對應：", col_level, col_word, col_pos, col_cn)
+# ==============================
+# 取得 DB 目前有多少資料
+# ==============================
+with db.cursor() as cursor:
+    cursor.execute("SELECT COUNT(*) AS c FROM words")
+    words_count = cursor.fetchone()["c"]
 
-# -----------------------------
-# 準備要做 embedding 的單字清單
-# -----------------------------
+    cursor.execute("SELECT COUNT(*) AS c FROM word_embeddings")
+    embed_count = cursor.fetchone()["c"]
+
+print(f"📊 words 表 = {words_count} 筆")
+print(f"📊 word_embeddings 表 = {embed_count} 筆\n")
+
+# ==============================
+# 找需要產生 embedding 的單字 (含 tqdm)
+# ==============================
 to_embed = []
 
 with db.cursor() as cursor:
-    for _, row in df.iterrows():
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="🔍 檢查需要 embedding 的單字"):
         word = str(row[col_word]).strip()
         if not word:
             continue
 
-        # 找對應 words 表的 id
-        cursor.execute(
-            "SELECT id FROM words WHERE word = %s LIMIT 1",
-            (word,),
-        )
-        r = cursor.fetchone()
-        if not r:
-            # 如果 DB 裡沒有這個 word，就跳過（你也可以選擇印出來）
-            # print(f"⚠️ DB 中找不到單字：{word}")
+        cursor.execute("SELECT id FROM words WHERE word=%s", (word,))
+        w = cursor.fetchone()
+        if not w:
             continue
 
-        word_id = r["id"]
+        word_id = w["id"]
 
-        # 檢查是否已經有 embedding，避免重複
-        cursor.execute(
-            "SELECT id FROM word_embeddings WHERE word_id = %s LIMIT 1",
-            (word_id,),
-        )
-        exists = cursor.fetchone()
-        if exists:
-            # print(f"⏭ 已有 embedding，略過：{word}")
+        cursor.execute("SELECT id FROM word_embeddings WHERE word_id=%s", (word_id,))
+        if cursor.fetchone():
             continue
 
-        to_embed.append(
-            {
-                "word_id": word_id,
-                "word": word,
-            }
-        )
+        to_embed.append({"word": word, "word_id": word_id})
 
-print(f"🧮 準備產生 embeddings 的單字數量：{len(to_embed)}")
+print(f"\n🧮 總共需要 embedding 的單字：{len(to_embed)}")
 
-if not to_embed:
-    print("✅ 看起來所有單字都已經有 embeddings 了，結束。")
+if len(to_embed) == 0:
+    print("👍 所有 embedding 都已存在，不需跑！")
     db.close()
-    raise SystemExit(0)
+    exit(0)
 
-# -----------------------------
-# 呼叫 OpenAI Embeddings 批次寫入
-# -----------------------------
-BATCH_SIZE = 100
-MODEL_NAME = "text-embedding-3-small"
-
+# ==============================
+# 開始產生 embeddings（含 ETA）
+# ==============================
+MODEL = "text-embedding-3-small"
+BATCH = 50
 total = len(to_embed)
 processed = 0
+start = time.time()
 
-try:
-    with db.cursor() as cursor:
-        for start in range(0, total, BATCH_SIZE):
-            batch = to_embed[start : start + BATCH_SIZE]
-            texts = [item["word"] for item in batch]
+def eta(start, done, total):
+    if done == 0:
+        return "計算中..."
+    speed = done / (time.time() - start)
+    left = (total - done) / speed
+    return f"{left:.1f} 秒"
 
-            print(f"🚀 呼叫 embeddings：{start+1} ~ {start+len(batch)} / {total}")
+with db.cursor() as cursor:
+    for i in range(0, total, BATCH):
+        batch = to_embed[i:i+BATCH]
+        words_list = [x["word"] for x in batch]
 
-            # 呼叫 OpenAI Embeddings
-            resp = client.embeddings.create(
-                model=MODEL_NAME,
-                input=texts,
+        print(f"\n🚀 Embedding {i+1} ~ {i+len(batch)} / {total}")
+        print("⏳ ETA:", eta(start, processed, total))
+
+        # ====== 呼叫 API（最多重試 3 次） ======
+        for retry in range(3):
+            try:
+                resp = client.embeddings.create(
+                    model=MODEL,
+                    input=words_list
+                )
+                break
+            except Exception as e:
+                print(f"⚠️ API 錯誤，重試 {retry+1}/3：", e)
+                time.sleep(2)
+        else:
+            raise RuntimeError("❌ API 重試 3 次仍失敗，請檢查網路或 API Key")
+
+        # ====== 寫入 DB ======
+        for item, emb in zip(batch, resp.data):
+            cursor.execute(
+                """
+                INSERT INTO word_embeddings (word_id, word, embedding)
+                VALUES (%s, %s, %s)
+                ON DUPLICATE KEY UPDATE embedding=VALUES(embedding)
+                """,
+                (item["word_id"], item["word"], json.dumps(emb.embedding)),
             )
 
-            # resp.data[i].embedding 是一個 float list
-            for item, emb_obj in zip(batch, resp.data):
-                embedding = emb_obj.embedding  # list[float]
-                cursor.execute(
-                    """
-                    INSERT INTO word_embeddings (word_id, word, embedding)
-                    VALUES (%s, %s, %s)
-                    ON DUPLICATE KEY UPDATE
-                      embedding = VALUES(embedding)
-                    """,
-                    (
-                        item["word_id"],
-                        item["word"],
-                        json.dumps(embedding),
-                    ),
-                )
+        db.commit()
 
-            db.commit()
-            processed += len(batch)
-            print(f"✅ 已寫入 {processed} / {total} 筆")
+        processed += len(batch)
+        percent = processed / total * 100
+        print(f"✅ 進度：{processed}/{total} ({percent:.2f}%)")
 
-            # 避免太快（可調整或註解掉）
-            time.sleep(0.2)
-
-except Exception:
-    print("❌ 產生 embeddings 時發生錯誤，準備回滾交易")
-    db.rollback()
-    traceback.print_exc()
-finally:
-    db.close()
-    print("🔚 結束，資料庫連線已關閉")
+db.close()
+print("\n🎉 全部 embeddings 生成完畢！")
