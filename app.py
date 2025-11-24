@@ -1,12 +1,13 @@
 import os
 import json
+import traceback
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from pymongo import MongoClient
 from openai import OpenAI
 
 # =====================================================
-# 載入 .env
+# Load .env
 # =====================================================
 try:
     from dotenv import load_dotenv
@@ -15,15 +16,16 @@ except:
     pass
 
 # =====================================================
-# MongoDB 連線
+# MongoDB
 # =====================================================
 MONGO_URL = os.getenv("MONGO_URL")
 if not MONGO_URL:
-    raise RuntimeError("❌ 請在 .env 設定 MONGO_URL")
+    raise RuntimeError("❌ Missing MONGO_URL in .env")
 
 mongo_client = MongoClient(MONGO_URL)
 db = mongo_client["wordcrack"]
 words_col = db["words"]
+
 
 # =====================================================
 # OpenAI
@@ -31,8 +33,10 @@ words_col = db["words"]
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
+# Flask
 app = Flask(__name__)
 CORS(app)
+
 
 # =====================================================
 # Health Check
@@ -47,7 +51,7 @@ def health():
 
 
 # =====================================================
-# 將 Mongo 文件轉成前端格式
+# Helper：Convert Mongo doc to frontend
 # =====================================================
 def doc_to_dict(doc):
     return {
@@ -60,7 +64,7 @@ def doc_to_dict(doc):
 
 
 # =====================================================
-# ⭐ 取得全部單字
+# Get All Words
 # =====================================================
 @app.route("/api/words")
 def get_words():
@@ -69,7 +73,7 @@ def get_words():
 
 
 # =====================================================
-# ⭐ 搜尋單字
+# Search
 # =====================================================
 @app.route("/api/search")
 def search():
@@ -80,13 +84,11 @@ def search():
     regex = {"$regex": q, "$options": "i"}
 
     cursor = words_col.find(
-        {
-            "$or": [
-                {"word": regex},
-                {"chinese": regex},
-                {"part_of_speech": regex},
-            ]
-        },
+        {"$or": [
+            {"word": regex},
+            {"chinese": regex},
+            {"part_of_speech": regex}
+        ]},
         {"embedding": 0}
     ).sort("word", 1)
 
@@ -94,7 +96,7 @@ def search():
 
 
 # =====================================================
-# ⭐ Vector Search
+# Vector Search
 # =====================================================
 @app.route("/api/words/similar_db", methods=["POST"])
 def similar_db():
@@ -105,18 +107,16 @@ def similar_db():
     if not word:
         return jsonify([])
 
-    # 找該字的 embedding
     base = words_col.find_one({"word": word})
     if not base or "embedding" not in base:
         return jsonify([])
 
     query_vec = base["embedding"]
 
-    # 使用 MongoDB Atlas Vector Search
     pipeline = [
         {
             "$vectorSearch": {
-                "index": "embedding_index",     # 你 Atlas 上的索引名稱
+                "index": "embedding_index",
                 "path": "embedding",
                 "queryVector": query_vec,
                 "numCandidates": 200,
@@ -156,7 +156,7 @@ def similar_db():
 
 
 # =====================================================
-# ⭐ 例句生成
+# Sentence API
 # =====================================================
 @app.route("/api/words/sentence", methods=["POST"])
 def sentence():
