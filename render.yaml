@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: wordcrack-backend
+    env: python
+    runtime: python3.10
+    region: singapore
+    plan: free
+
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+
+    envVars:
+      - key: MYSQL_HOST
+        value: your-railway-host
+      - key: MYSQL_USER
+        value: your-railway-user
+      - key: MYSQL_PASSWORD
+        value: your-railway-password
+      - key: MYSQL_DB
+        value: railway-db-name
+      - key: OPENAI_API_KEY
+        sync: false
