@@ -1,6 +1,6 @@
 import os
 import json
-import traceback
+import math
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from pymongo import MongoClient
@@ -26,7 +26,6 @@ mongo_client = MongoClient(MONGO_URL)
 db = mongo_client["wordcrack"]
 words_col = db["words"]
 
-
 # =====================================================
 # OpenAI
 # =====================================================
@@ -37,6 +36,25 @@ client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 app = Flask(__name__)
 CORS(app)
 
+# =====================================================
+# Helper：Convert + Fix NaN
+# =====================================================
+def doc_to_dict(doc):
+    return {
+        "id": str(doc.get("_id")),
+        "word": doc.get("word"),
+        "chinese": doc.get("chinese"),
+        "part_of_speech": doc.get("part_of_speech"),
+        "level": doc.get("level"),
+    }
+
+def fix_doc(d):
+    chinese = d.get("chinese")
+    if chinese is None:
+        d["chinese"] = ""
+    elif isinstance(chinese, float) and math.isnan(chinese):
+        d["chinese"] = ""
+    return d
 
 # =====================================================
 # Health Check
@@ -49,28 +67,25 @@ def health():
     except Exception:
         return jsonify({"ok": False})
 
-
-# =====================================================
-# Helper：Convert Mongo doc to frontend
-# =====================================================
-def doc_to_dict(doc):
-    return {
-        "id": str(doc.get("_id")),
-        "word": doc.get("word"),
-        "chinese": doc.get("chinese"),
-        "part_of_speech": doc.get("part_of_speech"),
-        "level": doc.get("level"),
-    }
-
-
 # =====================================================
 # Get All Words
 # =====================================================
 @app.route("/api/words")
 def get_words():
-    cursor = words_col.find({}, {"embedding": 0}).sort("word", 1)
-    return jsonify([doc_to_dict(x) for x in cursor])
+    try:
+        cursor = words_col.find({}, {"embedding": 0}).sort("word", 1)
+        return jsonify([fix_doc(doc_to_dict(x)) for x in cursor])
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
+# =====================================================
+# Search by letter
+# =====================================================
+@app.route("/api/words/by_letter/<letter>")
+def by_letter(letter):
+    regex = {"$regex": f"^{letter}", "$options": "i"}
+    cursor = words_col.find({"word": regex}, {"embedding": 0}).sort("word", 1)
+    return jsonify([fix_doc(doc_to_dict(x)) for x in cursor])
 
 # =====================================================
 # Search
@@ -92,8 +107,15 @@ def search():
         {"embedding": 0}
     ).sort("word", 1)
 
-    return jsonify([doc_to_dict(x) for x in cursor])
+    return jsonify([fix_doc(doc_to_dict(x)) for x in cursor])
 
+# =====================================================
+# Words by Level
+# =====================================================
+@app.route("/api/words/level/<int:lvl>")
+def words_by_level(lvl):
+    cursor = words_col.find({"level": lvl}, {"embedding": 0}).sort("word", 1)
+    return jsonify([fix_doc(doc_to_dict(x)) for x in cursor])
 
 # =====================================================
 # Vector Search
@@ -135,8 +157,8 @@ def similar_db():
     ]
 
     docs = list(words_col.aggregate(pipeline))
-
     results = []
+
     for d in docs:
         if d.get("word") == word:
             continue
@@ -154,7 +176,6 @@ def similar_db():
 
     return jsonify(results)
 
-
 # =====================================================
 # Sentence API
 # =====================================================
@@ -170,32 +191,36 @@ def sentence():
         })
 
     prompt = f"""
-    為單字「{word}」寫一個自然、生活化的英文例句（至少 10 字）。
-    回傳 JSON 格式：
-    {{
-        "sentence": "...",
-        "translation": "..."
-    }}
-    """
+你是一位英文老師。請為單字「{word}」寫一個自然、生活化的英文例句（至少 10 字）。
+務必只輸出 JSON。
 
-    res = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": prompt}]
-    )
+範例格式：
 
-    raw = res.choices[0].message.content.strip()
+{{
+  "sentence": "I have the ability to solve this problem with patience.",
+  "translation": "我有能力以耐心解決這個問題。"
+}}
+"""
 
     try:
-        return jsonify(json.loads(raw))
-    except:
+        res = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        raw = res.choices[0].message.content.strip()
+        response_json = json.loads(raw)
+        return jsonify(response_json)
+
+    except Exception as e:
         return jsonify({
             "sentence": f"I used the word '{word}' today.",
-            "translation": f"我今天用了「{word}」。"
+            "translation": f"我今天用了「{word}」。",
+            "error": str(e)
         })
 
-
 # =====================================================
-# RUN
+# RUN SERVER
 # =====================================================
 if __name__ == "__main__":
     app.run(port=5001, debug=True)
